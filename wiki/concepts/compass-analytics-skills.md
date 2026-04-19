@@ -1,6 +1,6 @@
 ---
 title: Compass Analytics Skills
-date_updated: 2026-04-06
+date_updated: 2026-04-19
 tags: [concept, compass, analytics-skills, data-platform]
 ---
 
@@ -44,42 +44,95 @@ tags: [concept, compass, analytics-skills, data-platform]
 
 **Trigger**: DAU, sessions, push notifications, email, SMS, WhatsApp, DND, app install, campaign performance
 
-### Tables
+*Fully cataloged 2026-04-18/19 via live Compass session. See `Deliverables/cmp-1-engagement-skill-spec.md` for complete schemas, SQL examples, and guardrails.*
 
-| Table | Rows/Day | Channel |
-|-------|----------|---------|
-| `engagement_pn_narad_master` | **170-250M** | Push (NARAD) |
-| `engagement_email_backend_master` | 3-6M | Email (Backend) |
-| `engagement_sms_backend_master` | 500-650K | SMS |
-| `engagement_whatsapp_backend_master` | 100-140K | WhatsApp |
-| `engagement_user_session_daily` | 8M | DAU (aggregated) |
-| `engagement_dau_indepth` | 8M | App engagement metrics |
-| `engagement_session_indepth` | **65M (57B total)** | Per-session detail |
-| `engagement_app_fact` | Weekly | App install/reachability |
-| `engagement_dnd_fact` | 70K | DND state changes |
+### Tables (all in `platform_iceberg.core_bgv`)
 
-### PN Delivery Funnel (typical day)
+| Table | Total rows | Rows/day | Channel | Partition | Last snapshot |
+|-------|-----------|----------|---------|-----------|---------------|
+| `engagement_pn_narad_master` | 92.7B | 170-250M | Push (NARAD) | `event_date` | 2026-04-17 daily |
+| `engagement_email_backend_master` | 5.5B | 3-14M | Email (Blazr/EMS) | `event_date` | 2026-04-17 daily |
+| `engagement_sms_backend_master` | 722M | 500-650K | SMS (INFOBIP) | `event_date` | 2026-04-17 daily |
+| `engagement_whatsapp_backend_master` | 47.7M | 100-140K | WhatsApp (GUPSHUP) | `event_date` | 2026-04-17 daily |
+| `engagement_user_session_daily` | 9.1B | 8M | DAU aggregated | `session_date` | 2026-04-17 daily |
+| `engagement_dau_indepth` | 8.5B | 8M | App engagement | `session_date` | 2026-04-17 daily |
+| `engagement_session_indepth` | **58.1B** | **60M** | Per-session detail | `session_date` | 2026-04-17 daily |
+| `engagement_app_fact` | 16.2B | Weekly | App install/reachability | `week` (Sundays) | 2026-04-13 |
+| `engagement_dnd_fact` | 92.5M | ~70K | DND state changes | **NONE** (COR table) | 2026-04-17 |
+| `engagement_email_narad_master` | — | — | Email (Narad/campaign) | `event_date` | — |
+
+> **`engagement_email_narad_master`** — recommended addition (#10). Campaign-level email tracking with `campaign_name`, `open_time`, `click_time`, `unsubscribe_time`. Mirrors PN narad for email.
+
+### PN Delivery Funnel (live 2026-04-17)
 
 ```
-Total: ~3M → Sent: ~2M (66%) → Received: ~440K (22%) → Shown: ~438K → Clicked: ~19K (4.3% CTR)
+Total attempts: ~249M → SENT: 181M (72.9%) → VENDOR_FAILURE: 32.5M (13.1%)
+OPTED_OUT: 23.6M (9.5%) → FREQUENCY_CAPPED: 11.6M (4.7%) → EXPIRED: 94K
+DND: 27K | INTERNAL_SERVICE_FAILURE: 1.4K
 ```
 
-### PN Status Distribution
+### PN Status Enum (7 values — wiki previously had 5)
 
-| Status | % |
-|--------|---|
-| SENT | 72% |
-| OPTED_OUT | 9% |
-| VENDOR_FAILURE | 9% |
-| FREQUENCY_CAPPED | 8.6% |
-| EXPIRED | 1.7% |
+| Status | % (2026-04-17) |
+|--------|----------------|
+| SENT | 72.9% |
+| VENDOR_FAILURE | 13.1% |
+| OPTED_OUT | 9.5% |
+| FREQUENCY_CAPPED | 4.7% |
+| EXPIRED | 0.04% |
+| DND | 0.01% |
+| INTERNAL_SERVICE_FAILURE | <0.01% |
 
-### Key Guardrails
+### Email Delivery Funnel (live 2026-04-17)
 
-- `engagement_session_indepth` has **57 BILLION rows** — SINGLE DAY queries only
-- PN NARAD `os` column: mixed casing (`android` vs `ANDROID`) — always use `LOWER(os)`
-- DND `s7` column is VARCHAR (`'true'`/`'false'`), not boolean
-- Prefer `engagement_user_session_daily` for DAU over `engagement_session_indepth`
+```
+Total: 5.4M records → Delivered: 5.2M (95.2%) → Opened: 622K (12.0% open rate)
+→ Clicked: 10.6K (1.7% click-to-open rate)
+```
+
+> Note: `event_name` in email_backend_master = **email template identifier** (e.g., `contract_note`, `git_mf_sip_order_processed`), NOT a delivery event. Delivery funnel = `deliver_flag`, `open_flag`, `click_flag` (integer 0/1).
+
+### Vendor mapping (confirmed)
+- Email: **AWS_SES** | Source: **Blazr**
+- SMS: **INFOBIP**
+- WhatsApp: **GUPSHUP**
+
+### App reachability (week 2026-04-13)
+- Android push-reachable: **26.6M** (80% of installed)
+- iOS push-reachable: **3.6M** (70% of installed)
+- Total push-reachable: **~30.2M**
+
+### Cross-skill join keys
+
+| Engagement table | Join to user_master on |
+|---|---|
+| email, sms, session_daily, app_fact | `e.user_account_id = u.user_account_id` |
+| **pn_narad, whatsapp** | **`pn.useraccountid = u.user_account_id`** (no underscore!) |
+| dau_indepth, session_indepth, dnd_fact | `e.cuid = u.cuid` (UUID format) |
+
+TTU segmentation: `growth_user_master.fid_ts_growth IS NOT NULL` → TTU user
+
+### Critical Guardrails (17 confirmed 2026-04-19)
+
+| # | Rule |
+|---|------|
+| G1 | Trino date syntax: `current_date - interval '1' day` (NOT `current_date - 1`) |
+| G2 | No `RIGHT()` in Trino — use `SUBSTR(str, LENGTH(str) - n + 1)` |
+| G3 | PN narad `os`: 6 raw values (android/ANDROID/Android/ios/IOS/iOS) — **always `LOWER(os)`** |
+| G4 | PN narad `status`: 7 values — includes DND and INTERNAL_SERVICE_FAILURE (not just 5) |
+| G5 | DND `s7`: VARCHAR `'true'`/`'false'` + 4 null rows — use `COALESCE(s7,'false')='true'` |
+| G6 | `engagement_session_indepth`: **60M rows/day** — single-day filter MANDATORY |
+| G7 | `session_duration` in session_indepth: frequently NULL — filter `IS NOT NULL` |
+| G8 | `comm_session` in session_indepth: NOT always null — CEP campaign attribution field |
+| G9 | email `event_name` = template name, NOT delivery status |
+| G10 | `txn_dau=1` with `session_count=0` is valid (API transactors) |
+| G11 | `app_fact` MAX(week) scan times out — always hardcode `week = DATE '2026-04-13'` |
+| G12 | SMS `priority`: mixed casing (`MEDIUM` vs `medium`) — use `LOWER(priority)` |
+| G13 | `app_fact os_name`: 4 values — Android, iOS, iPadOS, `iPhone OS` (legacy, 0 reachable) |
+| G14 | `os_name` casing: PN narad = mixed (use LOWER); session/DAU/app tables = Title Case |
+| G15 | `cuid` (UUID format) is the join key for dau_indepth/session_indepth/dnd_fact |
+| G16 | iOS PN `click_time` = always null — iOS click tracking not captured in this column |
+| G17 | `engagement_dnd_fact`: no partition (COR table) — `date` is a regular column |
 
 ## Skill #4: User Master & Growth
 
@@ -122,10 +175,21 @@ Each step = a timestamp column in `onb_usercheckpoints_master`. NULL = step not 
 - `daily_onb_conversions` is EMPTY, pipeline broken — use `daily_onboarding_and_fid`
 - `fact_onboarding_fno` has 154 columns — select only needed funnel steps
 
+## Build Status (as of 2026-04-19)
+
+| Task | Skill | Priority | Status |
+|------|-------|----------|--------|
+| CMP-1 | Engagement & Comms (#12) | Tier 1 — feeds Content Engine | **✅ done** — schemas, enums, 45 SQL examples, cross-skill joins all confirmed |
+| CMP-2 | Context Push (#13) | High — ground-up build | todo |
+| CMP-3 | User Financial Health (#14) | High — ground-up build | todo |
+| CMP-4 | MF Analytics Extended (#16) | High — extends existing MF skill | todo |
+
 ## Related
 
 - [[compass-mcp]] — the platform these skills run on
+- [[saurabh-dubey]] — built Compass MCP; Analytics Skills Deep Dive doc (18 pages) is the source of truth
 - [[narad]] — Engagement skill queries NARAD tables
+- [[groww-campaign-engine]] — Content Engine uses Compass to inform campaign strategy
 - [[activation-funnel]] — Onboarding skill covers the same funnel from the data side
 - [[segment-registry]] — User Master skill has the source data for segments
 - [[push-notifications]] — Engagement skill has PN delivery funnel data
