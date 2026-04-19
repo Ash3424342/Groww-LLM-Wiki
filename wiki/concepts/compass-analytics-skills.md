@@ -35,7 +35,81 @@ tags: [concept, compass, analytics-skills, data-platform]
 | 10 | **915 Trading** | 915 App | `userday_details_915`, `usersession_915` | 1.9M |
 | 11 | **Help & Support** | Support | `hns_helpdesktickets_master_trino`, `hns_chatbot_fact_table_v3` | 12M, 135K |
 | 12 | **Engagement** | Comms | `engagement_pn_narad_master`, `engagement_user_session_daily` | 250M/day, 8M |
-| 13 | **Context Push** | Notifications | Context-aware push tables | Varies |
+## Skill #13: Context Push Analytics
+
+**Trigger**: Context-aware push notifications, campaign orchestration, CEP (Campaign Execution Platform), C-MAB (Contextual Multi-Armed Bandit), push attribution, campaign config
+
+*Ground-up discovery 2026-04-19. See `Deliverables/cmp-2-context-push-skill-spec.md`. Tables are catalog-confirmed but Trino-restricted — elevated access required.*
+
+**Key insight:** CMP-2 is the *upstream* of CMP-1. CMP-1 covers delivery events (did the PN reach the user?). CMP-2 covers what decided who gets pushed, why, and whether it worked.
+
+### Tables discovered
+
+| Table | Schema | Rows | Freshness | Trino access | Role |
+|---|---|---|---|---|---|
+| `cep.campaign_info` | `platform_iceberg.cep` | 70K | 2026-04-18 (live, 6 commits/day) | ❌ Restricted | Campaign config master (MongoDB CDC) |
+| `dashboards_bgv.engagement_comms_attribution` | `platform_iceberg.dashboards_bgv` | 7.66B | 2026-04-18 (2 commits/day) | ❌ Restricted | Attribution bridge: msg_id → app session |
+| `ds_user_data.cmab_user_store_v3` | `platform_iceberg.ds_user_data` | 14.7M | 2026-02-26 (periodic batch) | ❌ Restricted | C-MAB user feature store (85 cols) |
+| `ds_user_data.cmab_interaction_logs` | `platform_iceberg.ds_user_data` | 10.5M | 2025-12-01 (stale) | ❌ Restricted | C-MAB inference logs (ML training data) |
+
+### cep.campaign_info — key columns
+
+- `campaignid` (bigint) — joins to `engagement_pn_narad_master.campaignid` (varchar) via `CAST(ci.campaignid AS varchar)`
+- `name` (varchar) — campaign display name (e.g., "17Apr'26 - Stock - Signup - Educational")
+- `state` (varchar) — LIVE, DRAFT, PAUSED, ARCHIVED
+- `campaigntype` (varchar) — GENERIC, JOURNEY
+- `campaigncategory` / `productentity` — categorization
+- `rules` array — targeting eligibility rules (attributeName, operator, values)
+- `schedule` — cron/trigger configuration
+- `actions` array — template content per channel (push/email/WA/story)
+- `current = true` — **mandatory filter** to get latest campaign version (MongoDB versioned CDC)
+- `createdat._date` — epoch ms in nested struct (access via `createdat._date`, not `createdat`)
+
+### engagement_comms_attribution — key columns
+
+- `session_date` (date) — **partition column** (7.66B rows — mandatory filter)
+- `cuid` / `suid` — user/session join to engagement_session_indepth
+- `msg_id` — joins to `engagement_pn_narad_master.msg_id`
+- `source` — communication source channel
+- `campaign_tag` / `campaign_type` — campaign classification
+
+### Architecture (CEP flow)
+
+```
+cep.campaign_info (config)
+   ↓ rules determine target users
+C-MAB (cmab_user_store_v3 = features) selects which PN per user
+   ↓ selected campaign dispatched via NARAD
+engagement_pn_narad_master (delivery event)
+   ↓ user clicks → opens app
+dashboards_bgv.engagement_comms_attribution (attribution)
+   ↓ links msg_id → cuid/suid
+engagement_session_indepth.comm_session = "CEP-{instanceId}-..."
+```
+
+### Guardrails
+
+| # | Guardrail |
+|---|---|
+| G1 | **All 4 tables Trino-restricted** — `cep`, `dashboards_bgv`, `ds_user_data` require elevated access not available to standard MCP token |
+| G2 | `cep.campaign_info.campaignid` = bigint; PN narad `campaignid` = varchar — join via `CAST(ci.campaignid AS varchar)` |
+| G3 | `current = true` mandatory on `cep.campaign_info` — MongoDB CDC has multiple versions per campaign |
+| G4 | Timestamps in `cep.campaign_info` are nested structs: `createdat._date` (epoch ms), not `createdat` |
+| G5 | `cmab_user_store_v3` is 52 days stale (Feb 2026); `cmab_interaction_logs` is 139 days stale (Dec 2025) |
+| G6 | `engagement_comms_attribution`: 7.66B rows — single-day filter on `session_date` mandatory |
+| G7 | Working alternative for attribution: `engagement_session_indepth.comm_session LIKE 'CEP-%'` (core_bgv, accessible) |
+
+### Workaround (no Trino access needed)
+
+`engagement_session_indepth.comm_session` in `core_bgv` carries CEP attribution:  
+Format: `CEP-{campaignInstanceId}-{bucket}-CAMPAIGN-PRODUCTION-{userId}-{counter}`  
+```sql
+-- Attribution rate via accessible core_bgv table
+SELECT COUNT(*) AS pn_attributed_sessions
+FROM platform_iceberg.core_bgv.engagement_session_indepth
+WHERE session_date = current_date - interval '1' day
+  AND comm_session LIKE 'CEP-%';
+```
 | 14 | **User Financial Health** | Wellness | Financial health tables | Varies |
 | 15 | **Datahub Navigation** | Meta | DataHub entities | N/A |
 | 16 | **MF Analytics Extended** | MF | Extended MF tables | Varies |
